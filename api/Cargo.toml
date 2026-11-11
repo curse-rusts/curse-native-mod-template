@@ -1,0 +1,7 @@
+[package]
+name = "mod-example_mod"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+curse-client = { git = "https://github.com/curse-rusts/curse-rust", rev = "6733a206366a67ef50dbb2e45a4d98e2df707ad1" }

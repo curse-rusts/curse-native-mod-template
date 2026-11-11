@@ -1,90 +1,127 @@
 #!/usr/bin/env python3
-"""Compile the real bundle on a tiny source fixture; no Horizon/assets required."""
+"""Check the bundle manifest, the package and the mod library without the game.
+
+Compiles `api/` as an ordinary library against a tiny `curse-client` stub, so the
+check runs offline and never needs the pinned Curse source.
+"""
 import json
-from pathlib import Path
+import os
+import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
-import horizon
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+import package  # noqa: E402
+
+ID = re.compile(r'^[a-z0-9_]{1,64}$')
 
 
-def run(command, **kwargs):
-    result = subprocess.run(command, capture_output=True, text=True, **kwargs)
-    if result.returncode:
-        raise RuntimeError(result.stdout + result.stderr)
-    return result
+def read():
+    return (tomllib.loads((ROOT / 'curse-mixin.toml').read_text()),
+            json.loads((ROOT / 'compatibility.json').read_text()))
 
 
-def snapshot(root):
-    return {str(p.relative_to(root)): (horizon.digest(p.read_bytes()), p.stat().st_mtime_ns)
-            for p in root.rglob('*') if p.is_file()}
+def check_manifest():
+    mixin, compat = read()
+    mod = mixin['mod']
+    assert ID.match(mod['id']), mod['id']
+    assert mod['version'] == '0.1.0', mod['version']
+    assert mixin['compatibility']['curse_revision'] == compat['curse_revision']
+    assert mixin['api']['path'] == 'api'
+    api = tomllib.loads((ROOT / 'api' / 'Cargo.toml').read_text())
+    assert api['package']['name'] == f"mod-{mod['id']}", api['package']['name']
+    assert api['package']['version'] == mod['version']
+    dep = api['dependencies']['curse-client']
+    assert dep['git'] == compat['curse_repository'], dep['git']
+    assert dep['rev'] == compat['curse_revision'], dep['rev']
+    lib = (ROOT / 'api' / 'src' / 'lib.rs').read_text()
+    assert 'pub fn hooks() -> Box<dyn Hooks>' in lib
+    assert 'fn player_logged_in' in lib
+    return mod['id'], mod['version'], compat
 
 
-def audit(original, stage, plan):
-    run(['cargo', 'run', '--quiet', '--locked', '--offline', '-p', 'native-mod-source-audit',
-         '--', str(original), str(stage), str(plan)], cwd=horizon.ROOT)
+def check_package(mod_id, version, compat):
+    with tempfile.TemporaryDirectory(prefix='curse-package-') as scratch:
+        first = package.package(ROOT, Path(scratch) / 'first.cmod', quiet=True)
+        second = package.package(ROOT, Path(scratch) / 'second.cmod', quiet=True)
+        assert first.read_bytes() == second.read_bytes(), 'packaging is not reproducible'
+        with zipfile.ZipFile(first) as archive:
+            names = archive.namelist()
+            assert len(names) == len(set(names))
+            for name in names:
+                parts = name.split('/')
+                assert '..' not in parts and '\\' not in name and not name.startswith('/')
+            manifest = json.loads(archive.read('curse-native.json'))
+            assert manifest == dict(schema=1, id=mod_id, version=version, game=compat['game'],
+                                    horizon=compat['curse_revision'],
+                                    mixins=compat['curse_mixins_revision'])
+            prefix = f'mixins/{mod_id}/'
+            bundle = [n for n in names if n != 'curse-native.json']
+            for name in bundle:
+                assert name.startswith(prefix), name
+                rest = name[len(prefix):]
+                assert rest.endswith(('.rs', '.toml')) or rest.split('/')[-1].startswith(
+                    ('README', 'LICENSE', 'LICENCE', 'COPYING', 'NOTICE')), rest
+            mixin = tomllib.loads(archive.read(prefix + 'curse-mixin.toml').decode())
+            assert mixin['mod']['id'] == manifest['id']
+            assert mixin['mod']['version'] == manifest['version']
+            assert mixin['compatibility']['curse_revision'] == manifest['horizon']
 
 
-def main():
-    root = horizon.ROOT
-    (root/'target').mkdir(exist_ok=True)
-    run(['cargo', 'build', '--locked', '--offline', '-p', 'horizon-mixins-cli'], cwd=horizon.MIXINS)
-    cli = horizon.MIXINS/'target/debug/horizon-mixins'
-    manifests = list((root/'mixins').glob('*/horizon-mixin.toml'))
-    assert len(manifests) == 1, 'this template test expects one example bundle'
-    manifest = tomllib.loads(manifests[0].read_text())
-    with tempfile.TemporaryDirectory(prefix='template-test-', dir=root/'target') as scratch:
+STUB = '''
+pub mod mod_api {
+    pub trait Hooks: Send + Sync {
+        fn player_logged_in(&self, _host: &mut dyn Host, _event: &mut PlayerLoggedInEvent<'_>) {}
+    }
+    pub trait Host {
+        fn tell(&mut self, _player: u128, _text: Text);
+    }
+    #[derive(Debug, PartialEq)]
+    pub struct Text(String);
+    impl Text {
+        pub fn literal(text: impl Into<String>) -> Self {
+            Text(text.into())
+        }
+    }
+    pub struct PlayerLoggedInEvent<'a> {
+        pub player: u128,
+        pub name: &'a str,
+    }
+}
+'''
+
+
+def check_library():
+    cargo = shutil.which('cargo')
+    if not cargo:
+        raise SystemExit('cargo not found: cannot compile the mod library')
+    with tempfile.TemporaryDirectory(prefix='curse-library-') as scratch:
         scratch = Path(scratch)
-        original, stage = scratch/'original', scratch/'stage'
-        (original/'crates/horizon-client/src').mkdir(parents=True)
-        (original/'Cargo.toml').write_text('[workspace]\nmembers=["crates/horizon-client"]\nresolver="2"\n')
-        (original/'crates/horizon-client/Cargo.toml').write_text('[package]\nname="horizon-client"\nversion="0.1.0"\nedition="2024"\n')
-        (original/'crates/horizon-client/src/lib.rs').write_text('pub mod game;\n')
-        (original/'crates/horizon-client/src/game.rs').write_text('''
-pub struct Game<'a> { pub positions: &'a mut Vec<[i32;3]> }
-impl Game<'_> {
-    pub fn break_block(&mut self,pos:[i32;3])->i32 {self.positions.push(pos); 7}
-}
-#[test] fn original_body_and_result_are_preserved() {
-    let mut positions=Vec::new();
-    let mut game=Game {positions:&mut positions};
-    assert_eq!(game.break_block([1,2,3]),7);
-    assert_eq!(game.break_block([-1,64,8]),7);
-    assert_eq!(positions,vec![[1,2,3],[-1,64,8]]);
-}
-''')
-        (original/'rust-toolchain.toml').write_bytes((root/'rust-toolchain.toml').read_bytes())
-        (original/'.horizon-revision').write_text(horizon.PIN+'\n')
-        run(['cargo', 'generate-lockfile', '--offline'], cwd=original)
-        before = snapshot(original)
-        base = ['--workspace', str(original), '--mods', str(root/'mixins')]
-        report = json.loads(run([str(cli), 'check', *base, '--out', str(stage), '--trust-native-mods']).stdout)
-        assert report['injections'] == 1 and report['modules'] == 1
-        assert '2 passed' in report['cargo_stdout']
-        first = snapshot(stage)
-        second = json.loads(run([str(cli), 'check', *base, '--out', str(stage), '--trust-native-mods']).stdout)
-        assert not second['stage_changed'] and snapshot(stage) == first
-        assert snapshot(original) == before
-        plan_path = scratch/'plan.json'
-        run([str(cli), 'plan', *base, '--out', str(plan_path)])
-        plan = json.loads(plan_path.read_text())
-        assert plan['schema'] == horizon.COMPAT['mixin_schema']
-        assert plan['injections'][0]['mod_id'] == manifest['mod']['id']
-        audit(original, stage, plan_path)
-        (original/'.horizon-revision').write_text('incompatible\n')
-        bad = subprocess.run([str(cli), 'apply', *base, '--out', str(stage)], capture_output=True, text=True)
-        assert bad.returncode and json.loads(bad.stderr)['code'] == 'E_REVISION'
-        assert snapshot(stage) == first
-        (original/'.horizon-revision').write_text(horizon.PIN+'\n')
-        source = original/'crates/horizon-client/src/game.rs'
-        source.write_text(source.read_text().replace('break_block', 'renamed_break_block'))
-        bad = subprocess.run([str(cli), 'apply', *base, '--out', str(stage)], capture_output=True, text=True)
-        assert bad.returncode and json.loads(bad.stderr)['code'] == 'E_TARGET_NOT_FOUND'
-        assert snapshot(stage) == first
-    print(json.dumps({'status': 'ok', 'compiled_runtime_and_original_body': True,
-                      'only_planned_asts_changed': True, 'deterministic_bytes_and_mtimes': True,
-                      'incompatible_revision_and_target_rejected': True}, indent=2))
+        stub = scratch / 'curse-client'
+        (stub / 'src').mkdir(parents=True)
+        (stub / 'Cargo.toml').write_text(
+            '[package]\nname = "curse-client"\nversion = "0.0.0"\nedition = "2024"\n')
+        (stub / 'src' / 'lib.rs').write_text(STUB)
+        api = scratch / 'api'
+        shutil.copytree(ROOT / 'api', api,
+                        ignore=shutil.ignore_patterns('target', 'Cargo.lock'))
+        manifest = (api / 'Cargo.toml').read_text()
+        manifest = re.sub(r'(?m)^curse-client = .*$',
+                          'curse-client = { path = "../curse-client" }', manifest)
+        assert '"../curse-client"' in manifest
+        (api / 'Cargo.toml').write_text(manifest)
+        env = dict(os.environ, CARGO_TARGET_DIR=str(scratch / 'target'))
+        subprocess.run([cargo, 'test', '--offline', '--quiet'], cwd=api, check=True, env=env)
 
 
 if __name__ == '__main__':
-    main()
+    mod_id, version, compat = check_manifest()
+    check_package(mod_id, version, compat)
+    check_library()
+    print(f'{mod_id} {version}: manifest, package and library checks pass')

@@ -1,0 +1,9 @@
+[mod]
+id = "example_mod"
+version = "0.1.0"
+
+[compatibility]
+curse_revision = "6733a206366a67ef50dbb2e45a4d98e2df707ad1"
+
+[api]
+path = "api"

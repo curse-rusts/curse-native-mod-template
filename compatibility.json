@@ -1,10 +1,7 @@
 {
-  "horizon_revision": "ba6344a59cb9e755b730dcf02285fc0d33b97d3c",
-  "source_sha256": {
-    "crates/horizon-client/src/game.rs": "043c7853552104e8250b89987f0ff5de86cbcec0abece1d319c268e66644015f"
-  },
-  "horizon_repository": "https://github.com/horizon-rust/horizon",
-  "horizon_mixins_repository": "https://github.com/horizon-rust/horizon-mixins",
-  "horizon_mixins_revision": "d9c83d7096b7ea5b83678da2efdfd6161f74997e",
-  "mixin_schema": 6
+  "curse_revision": "6733a206366a67ef50dbb2e45a4d98e2df707ad1",
+  "curse_repository": "https://github.com/curse-rusts/curse-rust",
+  "curse_mixins_revision": "e59da9094f0c2fdda6c627fe9eff22dec6a906f0",
+  "curse_mixins_repository": "https://github.com/curse-rusts/curse-mixins",
+  "game": "26.3"
 }
